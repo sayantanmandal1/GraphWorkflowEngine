@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Set, Any, Optional
 from queue import Queue, Empty
 from fastapi import WebSocket, WebSocketDisconnect
+from websockets.exceptions import ConnectionClosedError
 from pydantic import BaseModel
 
 from ..models.core import ExecutionStatus, LogEntry, LogEventType, ExecutionStatusEnum
@@ -88,19 +89,21 @@ class WebSocketManager:
             connection_id: ID of the connection to disconnect
         """
         if connection_id not in self._connections:
+            logger.debug(f"Attempted to disconnect non-existent connection: {connection_id}")
             return
         
         connection = self._connections[connection_id]
         connection.is_active = False
         
         # Unsubscribe from all runs
-        for run_id in list(connection.subscribed_runs):
+        subscribed_runs = list(connection.subscribed_runs)
+        for run_id in subscribed_runs:
             await self._unsubscribe_from_run(connection_id, run_id)
         
         # Remove connection
         del self._connections[connection_id]
         
-        logger.info(f"WebSocket connection disconnected and cleaned up: {connection_id}")
+        logger.info(f"WebSocket connection disconnected and cleaned up: {connection_id} (was subscribed to {len(subscribed_runs)} runs)")
     
     async def subscribe_to_run(self, connection_id: str, run_id: str) -> bool:
         """
@@ -315,13 +318,24 @@ class WebSocketManager:
             return True
             
         except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected during send: {connection_id}")
+            logger.debug(f"WebSocket disconnected during send: {connection_id}")
+            connection.is_active = False
+            return False
+        except ConnectionClosedError:
+            logger.debug(f"WebSocket connection closed during send: {connection_id}")
             connection.is_active = False
             return False
         except Exception as e:
-            logger.error(f"Error sending WebSocket message to {connection_id}: {str(e)}")
-            connection.is_active = False
-            return False
+            # Check if it's a connection-related error
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ['disconnect', 'closed', 'connection', 'receive']):
+                logger.debug(f"WebSocket connection error during send to {connection_id}: {str(e)}")
+                connection.is_active = False
+                return False
+            else:
+                logger.error(f"Unexpected error sending WebSocket message to {connection_id}: {str(e)}")
+                connection.is_active = False
+                return False
     
     async def send_to_connection(self, connection_id: str, data: Dict[str, Any]) -> bool:
         """

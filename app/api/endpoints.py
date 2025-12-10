@@ -792,20 +792,32 @@ async def websocket_monitor(websocket: WebSocket):
                         "timestamp": datetime.utcnow().isoformat()
                     })
                     
+            except WebSocketDisconnect:
+                # Client disconnected, break out of the message loop
+                logger.info(f"WebSocket client disconnected during message processing: {connection_id}")
+                break
             except json.JSONDecodeError:
                 # Invalid JSON message
-                await _websocket_manager.send_to_connection(connection_id, {
-                    "event_type": "error",
-                    "message": "Invalid JSON message format",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+                try:
+                    await _websocket_manager.send_to_connection(connection_id, {
+                        "event_type": "error",
+                        "message": "Invalid JSON message format",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                except WebSocketDisconnect:
+                    logger.info(f"WebSocket client disconnected while sending error message: {connection_id}")
+                    break
             except Exception as e:
                 logger.error(f"Error processing WebSocket message from {connection_id}: {str(e)}")
-                await _websocket_manager.send_to_connection(connection_id, {
-                    "event_type": "error",
-                    "message": f"Error processing message: {str(e)}",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
+                try:
+                    await _websocket_manager.send_to_connection(connection_id, {
+                        "event_type": "error",
+                        "message": f"Error processing message: {str(e)}",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                except WebSocketDisconnect:
+                    logger.info(f"WebSocket client disconnected while sending error message: {connection_id}")
+                    break
     
     except WebSocketDisconnect:
         logger.info(f"WebSocket client disconnected: {connection_id}")
