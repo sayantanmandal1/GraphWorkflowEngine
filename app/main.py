@@ -2,8 +2,8 @@
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from src.core.logging import setup_logging, get_logger
-from src.storage.database import create_tables
+from app.core.logging import setup_logging, get_logger
+from app.storage.database import create_tables
 
 
 @asynccontextmanager
