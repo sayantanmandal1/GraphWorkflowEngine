@@ -222,9 +222,14 @@ async def run_code_review_workflow():
     print("=== Code Review Summary ===")
     
     # Perfect code summary
-    perfect_results = [results.get(f"{tool}_perfect_code", {}) for tool in ["analyze", "style_check", "security_scan"]]
-    perfect_issues = sum(len(r.get('issues', [])) for r in perfect_results)
-    perfect_score = results.get('analyze_perfect_code', {}).get('score', 0)
+    perfect_analyze = results.get('analyze_perfect_code', {})
+    perfect_style = results.get('style_check_perfect', {})
+    perfect_security = results.get('security_scan_perfect', {})
+    
+    perfect_issues = (len(perfect_analyze.get('issues', [])) + 
+                     len(perfect_style.get('issues', [])) + 
+                     len(perfect_security.get('issues', [])))
+    perfect_score = perfect_analyze.get('score', 0)
     
     print(f"📋 Perfect Code Analysis:")
     print(f"   Total issues found: {perfect_issues}")
@@ -232,9 +237,14 @@ async def run_code_review_workflow():
     print(f"   Code quality: {'Excellent' if perfect_issues == 0 else 'Good' if perfect_issues < 3 else 'Needs improvement'}")
     
     # Faulty code summary  
-    faulty_results = [results.get(f"{tool}_faulty_code", {}) for tool in ["analyze", "style_check", "security_scan"]]
-    faulty_issues = sum(len(r.get('issues', [])) for r in faulty_results)
-    faulty_score = results.get('analyze_faulty_code', {}).get('score', 0)
+    faulty_analyze = results.get('analyze_faulty_code', {})
+    faulty_style = results.get('style_check_faulty', {})
+    faulty_security = results.get('security_scan_faulty', {})
+    
+    faulty_issues = (len(faulty_analyze.get('issues', [])) + 
+                    len(faulty_style.get('issues', [])) + 
+                    len(faulty_security.get('issues', [])))
+    faulty_score = faulty_analyze.get('score', 0)
     
     print(f"📋 Faulty Code Analysis:")
     print(f"   Total issues found: {faulty_issues}")
