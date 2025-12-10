@@ -38,7 +38,7 @@ class ExecutionContext:
 class ExecutionEngine:
     """Engine for executing workflow graphs with support for conditional branching, loops, and async execution."""
     
-    def __init__(self, tool_registry: ToolRegistry, state_manager: StateManager, graph_manager: GraphManager, max_concurrent_executions: int = 10):
+    def __init__(self, tool_registry: ToolRegistry, state_manager: StateManager, graph_manager: GraphManager, max_concurrent_executions: int = 10, websocket_manager=None):
         """Initialize the execution engine.
         
         Args:
@@ -46,10 +46,12 @@ class ExecutionEngine:
             state_manager: Manager for workflow state persistence
             graph_manager: Manager for graph definitions
             max_concurrent_executions: Maximum number of concurrent workflow executions
+            websocket_manager: Optional WebSocket manager for real-time monitoring
         """
         self.tool_registry = tool_registry
         self.state_manager = state_manager
         self.graph_manager = graph_manager
+        self.websocket_manager = websocket_manager
         
         # Concurrent execution management
         self._active_executions: Dict[str, Future] = {}
@@ -161,6 +163,13 @@ class ExecutionEngine:
                 run_id, None, LogEventType.WORKFLOW_START,
                 f"Started workflow execution for graph {graph_id}"
             )
+            
+            # Broadcast workflow start event
+            if self.websocket_manager:
+                self.websocket_manager.queue_workflow_event(
+                    run_id, "workflow_started",
+                    {"graph_id": graph_id, "message": f"Started workflow execution for graph {graph_id}"}
+                )
             
         except Exception as e:
             # Clean up on failure
@@ -292,6 +301,13 @@ class ExecutionEngine:
                     f"Workflow execution cancelled"
                 )
                 
+                # Broadcast cancellation
+                if self.websocket_manager:
+                    self.websocket_manager.queue_workflow_event(
+                        run_id, "workflow_cancelled",
+                        {"message": "Workflow execution cancelled"}
+                    )
+                
                 logger.info(f"Cancelled workflow execution: {run_id}")
             
             return cancelled
@@ -336,6 +352,10 @@ class ExecutionEngine:
                 run_id, None, LogEventType.WORKFLOW_COMPLETE,
                 f"Workflow execution failed: {error_message}"
             )
+            
+            # Broadcast workflow failure
+            if self.websocket_manager:
+                self.websocket_manager.queue_error(run_id, error_message)
             
         finally:
             # Always clean up execution resources
@@ -405,6 +425,13 @@ class ExecutionEngine:
                 final_state = context.state.model_dump()
             self.state_manager.finalize_run(run_id, ExecutionStatusEnum.COMPLETED, final_state)
             
+            # Broadcast workflow completion
+            if self.websocket_manager:
+                self.websocket_manager.queue_workflow_event(
+                    run_id, "workflow_completed",
+                    {"final_state": final_state, "message": "Workflow execution completed successfully"}
+                )
+            
             logger.info(f"Workflow execution completed successfully: {run_id}")
             
         except Exception as e:
@@ -463,6 +490,13 @@ class ExecutionEngine:
                 f"Starting execution of node {node.id}"
             )
             
+            # Broadcast node start
+            if self.websocket_manager:
+                self.websocket_manager.queue_node_execution(
+                    run_id, node.id, LogEventType.NODE_START,
+                    f"Starting execution of node {node.id}"
+                )
+            
             # Update current node in state
             context.state.current_node = node.id
             if node.id not in context.state.execution_path:
@@ -500,6 +534,14 @@ class ExecutionEngine:
                 context.state.model_dump()
             )
             
+            # Broadcast node completion
+            if self.websocket_manager:
+                self.websocket_manager.queue_node_execution(
+                    run_id, node.id, LogEventType.NODE_COMPLETE,
+                    f"Completed execution of node {node.id}",
+                    context.state.model_dump()
+                )
+            
             logger.debug(f"Successfully executed node {node.id} for run {run_id}")
             
         except Exception as e:
@@ -510,6 +552,13 @@ class ExecutionEngine:
                 run_id, node.id, LogEventType.NODE_ERROR,
                 error_message
             )
+            
+            # Broadcast node error
+            if self.websocket_manager:
+                self.websocket_manager.queue_node_execution(
+                    run_id, node.id, LogEventType.NODE_ERROR,
+                    error_message
+                )
             
             raise NodeExecutionError(error_message)
     

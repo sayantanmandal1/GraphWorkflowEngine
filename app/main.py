@@ -8,6 +8,7 @@ from app.core.graph_manager import GraphManager
 from app.core.execution_engine import ExecutionEngine
 from app.core.tool_registry import ToolRegistry
 from app.core.state_manager import StateManager
+from app.core.websocket_manager import WebSocketManager
 from app.api.endpoints import router, init_dependencies
 
 
@@ -27,11 +28,13 @@ async def lifespan(app: FastAPI):
     tool_registry = ToolRegistry()
     state_manager = StateManager()
     graph_manager = GraphManager()
+    websocket_manager = WebSocketManager()
     execution_engine = ExecutionEngine(
         tool_registry=tool_registry,
         state_manager=state_manager,
         graph_manager=graph_manager,
-        max_concurrent_executions=10
+        max_concurrent_executions=10,
+        websocket_manager=websocket_manager
     )
     
     # Register test tools
@@ -67,15 +70,27 @@ async def lifespan(app: FastAPI):
         graph_manager=graph_manager,
         execution_engine=execution_engine,
         tool_registry=tool_registry,
-        state_manager=state_manager
+        state_manager=state_manager,
+        websocket_manager=websocket_manager
     )
     
     logger.info("Core components initialized")
+    
+    # Start WebSocket broadcast processor
+    websocket_manager.start_broadcast_processor()
+    logger.info("WebSocket broadcast processor started")
     
     yield
     
     # Shutdown
     logger.info("Shutting down Agent Workflow Engine")
+    
+    # Stop WebSocket broadcast processor
+    try:
+        websocket_manager.stop_broadcast_processor()
+        logger.info("WebSocket broadcast processor stopped")
+    except Exception as e:
+        logger.error(f"Error stopping WebSocket broadcast processor: {str(e)}")
     
     # Shutdown execution engine
     try:

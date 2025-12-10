@@ -2,9 +2,10 @@
 
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+import json
 
 from ..core.graph_manager import GraphManager
 from ..core.execution_engine import ExecutionEngine
@@ -35,20 +36,23 @@ _graph_manager: Optional[GraphManager] = None
 _execution_engine: Optional[ExecutionEngine] = None
 _tool_registry: Optional[ToolRegistry] = None
 _state_manager: Optional[StateManager] = None
+_websocket_manager = None
 
 
 def init_dependencies(
     graph_manager: GraphManager,
     execution_engine: ExecutionEngine,
     tool_registry: ToolRegistry,
-    state_manager: StateManager
+    state_manager: StateManager,
+    websocket_manager=None
 ):
     """Initialize the global dependencies."""
-    global _graph_manager, _execution_engine, _tool_registry, _state_manager
+    global _graph_manager, _execution_engine, _tool_registry, _state_manager, _websocket_manager
     _graph_manager = graph_manager
     _execution_engine = execution_engine
     _tool_registry = tool_registry
     _state_manager = state_manager
+    _websocket_manager = websocket_manager
 
 
 def get_graph_manager() -> GraphManager:
@@ -695,6 +699,155 @@ async def cancel_execution(
             detail={
                 "error": "CancellationError",
                 "message": "An error occurred while cancelling execution",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+# WebSocket endpoint for real-time monitoring
+
+@router.websocket("/ws/monitor")
+async def websocket_monitor(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time workflow monitoring.
+    
+    Clients can connect to this endpoint to receive real-time updates about workflow executions.
+    
+    Message format for client messages:
+    {
+        "action": "subscribe" | "unsubscribe" | "ping",
+        "run_id": "optional_run_id_for_subscribe_unsubscribe"
+    }
+    
+    Message format for server messages:
+    {
+        "event_type": "connection_established" | "subscription_confirmed" | "workflow_started" | "node_execution" | "execution_error" | "workflow_completed" | "workflow_cancelled",
+        "run_id": "workflow_run_id",
+        "timestamp": "iso_timestamp",
+        "data": {...}
+    }
+    """
+    if not _websocket_manager:
+        await websocket.close(code=1011, reason="WebSocket monitoring not available")
+        return
+    
+    connection_id = None
+    try:
+        # Accept connection and get connection ID
+        connection_id = await _websocket_manager.connect(websocket)
+        logger.info(f"WebSocket client connected: {connection_id}")
+        
+        # Handle client messages
+        while True:
+            try:
+                # Receive message from client
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                action = message.get("action")
+                run_id = message.get("run_id")
+                
+                if action == "subscribe" and run_id:
+                    # Subscribe to workflow run updates
+                    success = await _websocket_manager.subscribe_to_run(connection_id, run_id)
+                    if not success:
+                        await _websocket_manager.send_to_connection(connection_id, {
+                            "event_type": "error",
+                            "message": f"Failed to subscribe to run {run_id}",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                
+                elif action == "unsubscribe" and run_id:
+                    # Unsubscribe from workflow run updates
+                    success = await _websocket_manager.unsubscribe_from_run(connection_id, run_id)
+                    if success:
+                        await _websocket_manager.send_to_connection(connection_id, {
+                            "event_type": "unsubscribed",
+                            "run_id": run_id,
+                            "message": f"Unsubscribed from run {run_id}",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                
+                elif action == "ping":
+                    # Respond to ping with pong
+                    await _websocket_manager.send_to_connection(connection_id, {
+                        "event_type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                
+                elif action == "get_status":
+                    # Send connection status information
+                    connection_info = _websocket_manager.get_connection_info()
+                    await _websocket_manager.send_to_connection(connection_id, {
+                        "event_type": "status_info",
+                        "data": connection_info,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                
+                else:
+                    # Unknown action
+                    await _websocket_manager.send_to_connection(connection_id, {
+                        "event_type": "error",
+                        "message": f"Unknown action: {action}",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+                    
+            except json.JSONDecodeError:
+                # Invalid JSON message
+                await _websocket_manager.send_to_connection(connection_id, {
+                    "event_type": "error",
+                    "message": "Invalid JSON message format",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message from {connection_id}: {str(e)}")
+                await _websocket_manager.send_to_connection(connection_id, {
+                    "event_type": "error",
+                    "message": f"Error processing message: {str(e)}",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected: {connection_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for connection {connection_id}: {str(e)}")
+    finally:
+        # Clean up connection
+        if connection_id:
+            await _websocket_manager.disconnect(connection_id)
+
+
+@router.get(
+    "/ws/connections",
+    summary="Get WebSocket connection information",
+    description="Retrieve information about active WebSocket connections"
+)
+async def get_websocket_connections() -> Dict[str, Any]:
+    """
+    Get information about active WebSocket connections.
+    
+    Returns:
+        Dictionary containing connection information
+    """
+    if not _websocket_manager:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WebSocket monitoring not available"
+        )
+    
+    try:
+        connection_info = _websocket_manager.get_connection_info()
+        return {
+            "websocket_monitoring": "active",
+            "connection_info": connection_info
+        }
+    except Exception as e:
+        logger.error(f"Error getting WebSocket connection info: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "WebSocketError",
+                "message": "Failed to retrieve connection information",
                 "details": {"original_error": str(e)}
             }
         )
