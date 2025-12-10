@@ -1,33 +1,26 @@
 # Agent Workflow Engine
 
-A lightweight, Python-based workflow engine that enables users to define, execute, and monitor computational workflows through a graph-based approach.
+A lightweight, Python-based workflow engine that enables users to define, execute, and monitor computational workflows through a graph-based approach. The system provides REST APIs for workflow management, real-time monitoring via WebSockets, and demonstrates its capabilities through practical workflow implementations.
 
 ## Features
 
-- Graph-based workflow definition with nodes and edges
-- REST API for workflow management
-- Real-time monitoring via WebSockets
-- State persistence and management
-- Tool registry for reusable functions
-- Concurrent execution support
+- **Graph-based Workflow Definition**: Create workflows using nodes (functions) and edges (execution flow)
+- **Tool Registry**: Register and manage reusable Python functions
+- **State Management**: Persistent state handling with SQLite storage
+- **Conditional Branching**: Support for if/else logic in workflows
+- **Concurrent Execution**: Run multiple workflows simultaneously with proper isolation
+- **REST API**: Complete HTTP API for workflow management
+- **WebSocket Monitoring**: Real-time execution monitoring and event streaming
+- **Error Handling**: Comprehensive error recovery and logging
 
-## Project Structure
+## Quick Start
 
-```
-app/
-├── api/           # FastAPI endpoints and WebSocket handlers
-├── core/          # Core workflow engine components
-├── models/        # Pydantic data models
-├── storage/       # Database models and storage layer
-└── main.py        # FastAPI application entry point
-```
+### Installation
 
-## Installation
-
-1. Create and activate virtual environment:
+1. Clone the repository:
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+git clone <repository-url>
+cd agent-workflow-engine
 ```
 
 2. Install dependencies:
@@ -35,89 +28,124 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Initialize the database:
+3. Run the comprehensive example:
 ```bash
-python app/startup.py db init
+python workflow_example.py
 ```
 
-## Configuration
-
-The application uses environment variables for configuration. Copy `.env.example` to `.env` and modify as needed:
-
-```bash
-cp .env.example .env
-```
-
-Key configuration options:
-- `WORKFLOW_ENGINE_DATABASE_URL`: Database connection URL
-- `WORKFLOW_ENGINE_MAX_CONCURRENT_EXECUTIONS`: Maximum concurrent workflows
-- `WORKFLOW_ENGINE_LOG_LEVEL`: Logging level (DEBUG, INFO, WARNING, ERROR)
-- `WORKFLOW_ENGINE_HOST`: Server host (default: 0.0.0.0)
-- `WORKFLOW_ENGINE_PORT`: Server port (default: 8000)
-
-## Running the Application
-
-### Using the startup script (recommended):
-```bash
-# Run with default settings
-python app/startup.py run
-
-# Run with custom configuration
-python app/startup.py --host 127.0.0.1 --port 8080 --debug run
-
-# Run in development mode
-python app/startup.py --env development run
-
-# Show configuration
-python app/startup.py config show
-
-# Run health checks
-python app/startup.py health --detailed
-```
-
-### Using the main module directly:
+4. Start the API server:
 ```bash
 python -m app.main
 ```
 
-### Using Docker:
-```bash
-# Build and run with Docker Compose
-docker-compose up --build
+The API will be available at `http://localhost:8000` with interactive documentation at `http://localhost:8000/docs`.
 
-# Or build and run manually
-docker build -t workflow-engine .
-docker run -p 8000:8000 workflow-engine
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    FastAPI Web Layer                        │
+├─────────────────────────────────────────────────────────────┤
+│                  Workflow Engine Core                       │
+├─────────────────────────────────────────────────────────────┤
+│     Graph Manager    │    Execution Engine    │   Tool Registry │
+├─────────────────────────────────────────────────────────────┤
+│              State Management & Persistence                  │
+├─────────────────────────────────────────────────────────────┤
+│                   Storage Layer (SQLite)                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-The API will be available at `http://localhost:8000`
+## Core Components
 
-## API Documentation
+### Graph Manager
+Handles workflow graph creation, validation, and storage. Ensures graphs are properly structured with valid node references and execution paths.
 
-Once running, visit `http://localhost:8000/docs` for interactive API documentation.
+### Execution Engine
+Executes workflow nodes, manages state transitions, handles control flow (branching and loops), and supports concurrent execution with proper isolation.
 
-## Health Checks
+### Tool Registry
+Manages reusable Python functions that can be called by workflow nodes. Provides registration, retrieval, and conflict prevention.
 
-The application provides several health check endpoints:
+### State Manager
+Handles state persistence, isolation between workflow runs, and consistency across the execution lifecycle.
 
-- `GET /health` - Basic health check
-- `GET /health/detailed` - Detailed component health status
-- `GET /health/ready` - Readiness check for container orchestration
-- `GET /health/live` - Liveness check for container orchestration
+## Complete Example
 
-## Database Management
+The `workflow_example.py` file demonstrates all system capabilities:
 
+- **Mathematical Processing Workflow**: Shows basic operations with conditional branching
+- **Code Review Workflow**: Analyzes Python code quality and generates reports
+- **Tool Registration**: How to register custom functions
+- **State Management**: How state flows between workflow nodes
+- **Error Handling**: Graceful handling of execution failures
+
+Run the example to see everything in action:
 ```bash
-# Initialize database tables
-python app/startup.py db init
-
-# Run database migrations
-python app/startup.py db migrate
-
-# Reset database (drop and recreate)
-python app/startup.py db reset
+python workflow_example.py
 ```
 
-## Development Status
+## API Usage
 
-This project implements a complete workflow engine with modern Python architecture and clean design principles.
+### Create and Execute Workflows
+
+```python
+# 1. Register tools
+tool_registry.register_tool("my_function", my_function, "Description")
+
+# 2. Create workflow graph
+workflow = GraphDefinition(
+    name="My Workflow",
+    nodes=[NodeDefinition(id="step1", function_name="my_function")],
+    edges=[],
+    entry_point="step1"
+)
+
+# 3. Execute workflow
+graph_id = graph_manager.create_graph(workflow)
+run_id = execution_engine.execute_workflow(graph_id, {"initial": "data"})
+
+# 4. Monitor progress
+status = execution_engine.get_execution_status(run_id)
+```
+
+### REST API Endpoints
+
+- `POST /graph/create` - Create workflow graph
+- `POST /graph/run` - Execute workflow
+- `GET /graph/state/{run_id}` - Get execution status
+- `GET /graph/logs/{run_id}` - Get execution logs
+- `WebSocket /ws` - Real-time monitoring
+
+## Project Structure
+
+```
+agent-workflow-engine/
+├── app/
+│   ├── api/           # REST API endpoints
+│   ├── core/          # Core workflow engine components
+│   ├── models/        # Pydantic data models
+│   ├── storage/       # Database models and operations
+│   └── tools/         # Built-in workflow tools
+├── workflow_example.py # Comprehensive example
+├── requirements.txt   # Dependencies
+└── README.md         # This file
+```
+
+## Configuration
+
+Configure via environment variables or `AppConfig`:
+
+```python
+from app.config import AppConfig
+
+config = AppConfig(
+    app_name="My Workflow Engine",
+    debug=True,
+    database_url="sqlite:///workflows.db"
+)
+```
+
+## License
+
+This project is licensed under the MIT License.

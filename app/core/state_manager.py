@@ -13,7 +13,7 @@ from ..storage.models import WorkflowRunModel, LogEntryModel
 from ..models.core import WorkflowState, ExecutionStatusEnum, LogEventType
 from .exceptions import StateManagementError, StorageError, TransientError
 from .logging import get_logger, set_logging_context, clear_logging_context
-from .error_recovery import with_retry, RetryConfig
+# Removed error_recovery dependency for simplified codebase
 
 logger = get_logger(__name__)
 
@@ -47,7 +47,6 @@ class StateManager:
         self._state_lock_manager = threading.RLock()
         logger.info("StateManager initialized")
     
-    @with_retry(RetryConfig(max_attempts=3, retryable_exceptions=[StorageError, TransientError]))
     def create_run_state(self, run_id: str, graph_id: str, initial_state: Dict[str, Any]) -> None:
         """
         Create a new workflow run with initial state.

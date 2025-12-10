@@ -21,7 +21,7 @@ from .exceptions import (
     ResourceExhaustionError, TransientError
 )
 from .logging import get_logger, set_logging_context, clear_logging_context
-from .error_recovery import with_retry, RetryConfig, CircuitBreaker
+# Removed error_recovery dependency for simplified codebase
 from .tool_registry import ToolRegistry
 from .state_manager import StateManager
 from .graph_manager import GraphManager
