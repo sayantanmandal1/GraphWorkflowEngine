@@ -14,6 +14,7 @@ from .logging import setup_logging, get_logger
 from .tool_registry import ToolRegistry
 from .graph_manager import GraphManager
 from .state_manager import StateManager
+from .execution_engine import ExecutionEngine
 
 __all__ = [
     "WorkflowEngineError",
@@ -29,4 +30,5 @@ __all__ = [
     "ToolRegistry",
     "GraphManager",
     "StateManager",
+    "ExecutionEngine",
 ]

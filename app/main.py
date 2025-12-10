@@ -4,6 +4,11 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.core.logging import setup_logging, get_logger
 from app.storage.database import create_tables
+from app.core.graph_manager import GraphManager
+from app.core.execution_engine import ExecutionEngine
+from app.core.tool_registry import ToolRegistry
+from app.core.state_manager import StateManager
+from app.api.endpoints import router, init_dependencies
 
 
 @asynccontextmanager
@@ -18,10 +23,66 @@ async def lifespan(app: FastAPI):
     create_tables()
     logger.info("Database tables created")
     
+    # Initialize core components
+    tool_registry = ToolRegistry()
+    state_manager = StateManager()
+    graph_manager = GraphManager()
+    execution_engine = ExecutionEngine(
+        tool_registry=tool_registry,
+        state_manager=state_manager,
+        graph_manager=graph_manager,
+        max_concurrent_executions=10
+    )
+    
+    # Register test tools
+    from app.tools.test_tools import (
+        test_function,
+        simple_math_function,
+        conditional_function,
+        state_logger_function
+    )
+    
+    # Register tools, handling cases where they might already exist
+    tools_to_register = [
+        ("test_function", test_function, "A simple test function for workflow testing"),
+        ("simple_math_function", simple_math_function, "Performs basic math operations on workflow state"),
+        ("conditional_function", conditional_function, "Demonstrates conditional logic based on state values"),
+        ("state_logger_function", state_logger_function, "Logs current workflow state for debugging")
+    ]
+    
+    for tool_name, tool_func, tool_desc in tools_to_register:
+        try:
+            if not tool_registry.tool_exists(tool_name):
+                tool_registry.register_tool(tool_name, tool_func, tool_desc)
+                logger.info(f"Registered tool: {tool_name}")
+            else:
+                logger.info(f"Tool already exists: {tool_name}")
+        except Exception as e:
+            logger.warning(f"Failed to register tool {tool_name}: {e}")
+    
+    logger.info("Test tools registration completed")
+    
+    # Initialize API dependencies
+    init_dependencies(
+        graph_manager=graph_manager,
+        execution_engine=execution_engine,
+        tool_registry=tool_registry,
+        state_manager=state_manager
+    )
+    
+    logger.info("Core components initialized")
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Agent Workflow Engine")
+    
+    # Shutdown execution engine
+    try:
+        execution_engine.shutdown()
+        logger.info("Execution engine shutdown completed")
+    except Exception as e:
+        logger.error(f"Error during execution engine shutdown: {str(e)}")
 
 
 # Create FastAPI application
@@ -31,6 +92,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Include API router
+app.include_router(router)
 
 
 @app.get("/")

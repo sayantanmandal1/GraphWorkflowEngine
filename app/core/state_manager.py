@@ -2,6 +2,7 @@
 
 import json
 import uuid
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from sqlalchemy.orm import Session
@@ -41,7 +42,8 @@ class StateManager:
     def __init__(self):
         """Initialize the StateManager."""
         self._active_runs: Dict[str, WorkflowState] = {}
-        self._run_locks: Dict[str, bool] = {}
+        self._run_locks: Dict[str, threading.RLock] = {}
+        self._state_lock_manager = threading.RLock()
         logger.info("StateManager initialized")
     
     def create_run_state(self, run_id: str, graph_id: str, initial_state: Dict[str, Any]) -> None:
@@ -73,9 +75,10 @@ class StateManager:
                 execution_path=[]
             )
             
-            # Store in memory for active runs
-            self._active_runs[run_id] = workflow_state
-            self._run_locks[run_id] = False
+            # Store in memory for active runs with proper locking
+            with self._state_lock_manager:
+                self._active_runs[run_id] = workflow_state
+                self._run_locks[run_id] = threading.RLock()
             
             # Persist to database
             db = next(get_db())
@@ -113,8 +116,9 @@ class StateManager:
                 
         except Exception as e:
             # Clean up in-memory state if database operation failed
-            self._active_runs.pop(run_id, None)
-            self._run_locks.pop(run_id, None)
+            with self._state_lock_manager:
+                self._active_runs.pop(run_id, None)
+                self._run_locks.pop(run_id, None)
             
             if isinstance(e, (StateManagementError, StorageError)):
                 raise
@@ -137,14 +141,16 @@ class StateManager:
             if not run_id or run_id not in self._active_runs:
                 raise StateManagementError(f"Run {run_id} not found or not active")
             
-            # Check if run is locked (being modified by another operation)
-            if self._run_locks.get(run_id, False):
-                raise StateManagementError(f"Run {run_id} is currently locked for modification")
+            # Get the run-specific lock
+            run_lock = None
+            with self._state_lock_manager:
+                run_lock = self._run_locks.get(run_id)
+                if not run_lock:
+                    raise StateManagementError(f"Run {run_id} lock not found")
             
-            # Lock the run for this update
-            self._run_locks[run_id] = True
+            # Acquire the run-specific lock for this update
+            with run_lock:
             
-            try:
                 # Get current state
                 current_state = self._active_runs[run_id]
                 
@@ -190,10 +196,6 @@ class StateManager:
                     raise StorageError(f"Failed to persist state update: {str(e)}")
                 finally:
                     db.close()
-                    
-            finally:
-                # Always unlock the run
-                self._run_locks[run_id] = False
                 
         except Exception as e:
             if isinstance(e, (StateManagementError, StorageError)):
@@ -349,8 +351,9 @@ class StateManager:
                 db.close()
             
             # Clean up in-memory state
-            self._active_runs.pop(run_id, None)
-            self._run_locks.pop(run_id, None)
+            with self._state_lock_manager:
+                self._active_runs.pop(run_id, None)
+                self._run_locks.pop(run_id, None)
             
         except Exception as e:
             if isinstance(e, (StateManagementError, StorageError)):
@@ -450,8 +453,9 @@ class StateManager:
                         recovered_state = WorkflowState(**run_model.current_state)
                         
                         # Update in-memory state
-                        self._active_runs[run_id] = recovered_state
-                        self._run_locks[run_id] = False
+                        with self._state_lock_manager:
+                            self._active_runs[run_id] = recovered_state
+                            self._run_locks[run_id] = threading.RLock()
                         
                         # Validate the recovered state
                         if self.validate_state_consistency(run_id):
@@ -511,8 +515,9 @@ class StateManager:
                 cleanup_count = 0
                 for run in old_runs:
                     # Remove from in-memory state if present
-                    self._active_runs.pop(run.id, None)
-                    self._run_locks.pop(run.id, None)
+                    with self._state_lock_manager:
+                        self._active_runs.pop(run.id, None)
+                        self._run_locks.pop(run.id, None)
                     
                     # Delete log entries first (foreign key constraint)
                     db.query(LogEntryModel).filter(LogEntryModel.run_id == run.id).delete()
