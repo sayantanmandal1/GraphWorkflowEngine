@@ -11,6 +11,9 @@ from .exceptions import (
     APIError,
 )
 from .logging import setup_logging, get_logger
+from .tool_registry import ToolRegistry
+from .graph_manager import GraphManager
+from .state_manager import StateManager
 
 __all__ = [
     "WorkflowEngineError",
@@ -23,4 +26,7 @@ __all__ = [
     "APIError",
     "setup_logging",
     "get_logger",
+    "ToolRegistry",
+    "GraphManager",
+    "StateManager",
 ]
