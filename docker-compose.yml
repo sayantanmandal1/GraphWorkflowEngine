@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  workflow-engine:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - WORKFLOW_ENGINE_DEBUG=false
+      - WORKFLOW_ENGINE_LOG_LEVEL=INFO
+      - WORKFLOW_ENGINE_DATABASE_URL=sqlite:///./data/workflow_engine.db
+      - WORKFLOW_ENGINE_MAX_CONCURRENT_EXECUTIONS=10
+    volumes:
+      - workflow_data:/app/data
+      - workflow_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health/live')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: PostgreSQL database for production use
+  # postgres:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_DB: workflow_engine
+  #     POSTGRES_USER: workflow_user
+  #     POSTGRES_PASSWORD: workflow_password
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U workflow_user -d workflow_engine"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+
+volumes:
+  workflow_data:
+  workflow_logs:
+  # postgres_data:

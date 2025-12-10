@@ -40,7 +40,7 @@ class WorkflowEngineDemo:
                 # Data Ingestion Stage
                 {
                     "id": "data_ingestion",
-                    "function_name": "test_function",
+                    "function_name": "workflow_test_function",
                     "parameters": {
                         "message": "Starting data ingestion from multiple sources",
                         "data": {
@@ -124,7 +124,7 @@ class WorkflowEngineDemo:
                 # Final Notification
                 {
                     "id": "send_notification",
-                    "function_name": "test_function",
+                    "function_name": "workflow_test_function",
                     "parameters": {
                         "message": "Pipeline execution completed successfully",
                         "notification_type": "success"
@@ -161,7 +161,7 @@ class WorkflowEngineDemo:
             "nodes": [
                 {
                     "id": "data_preparation",
-                    "function_name": "test_function",
+                    "function_name": "workflow_test_function",
                     "parameters": {
                         "message": "Preparing training dataset",
                         "data": {
@@ -223,7 +223,7 @@ class WorkflowEngineDemo:
             "nodes": [
                 {
                     "id": "initialize_process",
-                    "function_name": "test_function",
+                    "function_name": "workflow_test_function",
                     "parameters": {
                         "message": "Initializing error-prone process",
                         "simulate_error": False

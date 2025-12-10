@@ -6,7 +6,7 @@ from ..core.logging import get_logger
 logger = get_logger(__name__)
 
 
-def test_function(state: Dict[str, Any], context: Optional[Any] = None, message: str = "Default message", **kwargs) -> Dict[str, Any]:
+def workflow_test_function(state: Dict[str, Any], context: Optional[Any] = None, message: str = "Default message", **kwargs) -> Dict[str, Any]:
     """
     A simple test function for workflow testing.
     
@@ -25,7 +25,7 @@ def test_function(state: Dict[str, Any], context: Optional[Any] = None, message:
     result = {
         "test_message": message,
         "execution_count": state.get("execution_count", 0) + 1,
-        "last_executed": "test_function"
+        "last_executed": "workflow_test_function"
     }
     
     # Log the execution

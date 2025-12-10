@@ -4,7 +4,7 @@ import asyncio
 import uuid
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable, Set
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from sqlalchemy.orm import Session
@@ -16,8 +16,12 @@ from ..models.core import (
     GraphDefinition, NodeDefinition, EdgeDefinition, WorkflowState,
     ExecutionStatus, ExecutionStatusEnum, LogEntry, LogEventType
 )
-from .exceptions import ExecutionEngineError, NodeExecutionError, StateManagementError
-from .logging import get_logger
+from .exceptions import (
+    ExecutionEngineError, NodeExecutionError, StateManagementError,
+    ResourceExhaustionError, TransientError
+)
+from .logging import get_logger, set_logging_context, clear_logging_context
+from .error_recovery import with_retry, RetryConfig, CircuitBreaker
 from .tool_registry import ToolRegistry
 from .state_manager import StateManager
 from .graph_manager import GraphManager
@@ -908,6 +912,443 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Error releasing resource lock for {resource_name}: {str(e)}")
     
+    def query_historical_executions(self, graph_id: Optional[str] = None, status: Optional[str] = None,
+                                  start_date: Optional[datetime] = None, end_date: Optional[datetime] = None,
+                                  limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        """
+        Query historical workflow executions with filtering and pagination.
+        
+        Args:
+            graph_id: Filter by graph ID (optional)
+            status: Filter by execution status (optional)
+            start_date: Filter executions after this date (optional)
+            end_date: Filter executions before this date (optional)
+            limit: Maximum number of results
+            offset: Number of results to skip
+            
+        Returns:
+            Dictionary containing executions list, total count, and pagination info
+            
+        Raises:
+            ExecutionEngineError: If query fails
+        """
+        try:
+            db = next(get_db())
+            try:
+                # Build query with filters
+                query = db.query(WorkflowRunModel)
+                
+                if graph_id:
+                    query = query.filter(WorkflowRunModel.graph_id == graph_id)
+                
+                if status:
+                    query = query.filter(WorkflowRunModel.status == status)
+                
+                if start_date:
+                    query = query.filter(WorkflowRunModel.started_at >= start_date)
+                
+                if end_date:
+                    query = query.filter(WorkflowRunModel.started_at <= end_date)
+                
+                # Get total count for pagination
+                total_count = query.count()
+                
+                # Apply pagination and ordering
+                executions = (
+                    query.order_by(WorkflowRunModel.started_at.desc())
+                    .offset(offset)
+                    .limit(limit)
+                    .all()
+                )
+                
+                # Convert to response format
+                execution_summaries = []
+                for run in executions:
+                    duration_seconds = None
+                    if run.completed_at and run.started_at:
+                        duration_seconds = (run.completed_at - run.started_at).total_seconds()
+                    
+                    summary = {
+                        "run_id": run.id,
+                        "graph_id": run.graph_id,
+                        "status": run.status,
+                        "started_at": run.started_at,
+                        "completed_at": run.completed_at,
+                        "duration_seconds": duration_seconds,
+                        "error_message": run.error_message
+                    }
+                    execution_summaries.append(summary)
+                
+                has_more = (offset + limit) < total_count
+                
+                logger.debug(f"Historical query returned {len(execution_summaries)} executions out of {total_count} total")
+                
+                return {
+                    "executions": execution_summaries,
+                    "total_count": total_count,
+                    "has_more": has_more
+                }
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to query historical executions: {str(e)}")
+    
+    def get_historical_execution_status(self, run_id: str) -> ExecutionStatus:
+        """
+        Get the execution status of a historical workflow run.
+        
+        Args:
+            run_id: ID of the workflow run
+            
+        Returns:
+            Historical execution status
+            
+        Raises:
+            ExecutionEngineError: If run not found
+        """
+        try:
+            db = next(get_db())
+            try:
+                run_model = db.query(WorkflowRunModel).filter(WorkflowRunModel.id == run_id).first()
+                if not run_model:
+                    raise ExecutionEngineError(f"Historical run {run_id} not found")
+                
+                # Reconstruct state from final_state or current_state
+                state_data = run_model.final_state or run_model.current_state or {}
+                if isinstance(state_data, dict):
+                    current_state = WorkflowState(**state_data)
+                else:
+                    # Fallback for legacy data
+                    current_state = WorkflowState(
+                        data=state_data if isinstance(state_data, dict) else {},
+                        metadata={},
+                        current_node=run_model.current_node,
+                        execution_path=run_model.execution_path or []
+                    )
+                
+                # Create ExecutionStatus object
+                status = ExecutionStatus(
+                    run_id=run_id,
+                    graph_id=run_model.graph_id,
+                    status=ExecutionStatusEnum(run_model.status),
+                    current_state=current_state,
+                    started_at=run_model.started_at,
+                    completed_at=run_model.completed_at,
+                    error_message=run_model.error_message
+                )
+                
+                return status
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to get historical execution status: {str(e)}")
+    
+    def get_historical_execution_logs(self, run_id: str) -> List[LogEntry]:
+        """
+        Get execution logs for a historical workflow run.
+        
+        Args:
+            run_id: ID of the workflow run
+            
+        Returns:
+            List of log entries in chronological order
+            
+        Raises:
+            ExecutionEngineError: If run not found
+        """
+        try:
+            db = next(get_db())
+            try:
+                # First check if the run exists
+                run_exists = db.query(WorkflowRunModel).filter(WorkflowRunModel.id == run_id).first()
+                if not run_exists:
+                    raise ExecutionEngineError(f"Historical run {run_id} not found")
+                
+                # Get log entries with optimized query
+                log_models = (
+                    db.query(LogEntryModel)
+                    .filter(LogEntryModel.run_id == run_id)
+                    .order_by(LogEntryModel.timestamp)
+                    .all()
+                )
+                
+                logs = []
+                for log_model in log_models:
+                    log_entry = LogEntry(
+                        timestamp=log_model.timestamp,
+                        run_id=log_model.run_id,
+                        node_id=log_model.node_id or "",
+                        event_type=LogEventType(log_model.event_type),
+                        message=log_model.message,
+                        state_snapshot=log_model.state_snapshot
+                    )
+                    logs.append(log_entry)
+                
+                return logs
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to get historical execution logs: {str(e)}")
+    
+    def archive_old_executions(self, max_age_days: int) -> Dict[str, Any]:
+        """
+        Archive old completed executions to optimize database performance.
+        
+        Args:
+            max_age_days: Archive executions older than this many days
+            
+        Returns:
+            Dictionary containing archive operation results
+            
+        Raises:
+            ExecutionEngineError: If archiving fails
+        """
+        try:
+            from datetime import timedelta
+            cutoff_date = datetime.utcnow() - timedelta(days=max_age_days)
+            
+            db = next(get_db())
+            try:
+                # Find old completed executions
+                old_runs = (
+                    db.query(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_([
+                        ExecutionStatusEnum.COMPLETED.value,
+                        ExecutionStatusEnum.FAILED.value,
+                        ExecutionStatusEnum.CANCELLED.value
+                    ]))
+                    .filter(WorkflowRunModel.completed_at < cutoff_date)
+                    .all()
+                )
+                
+                archived_count = 0
+                deleted_count = 0
+                
+                # For now, we'll implement a simple cleanup strategy
+                # In a production system, you might want to move data to an archive table
+                for run in old_runs:
+                    # Archive strategy: keep the run record but remove detailed logs
+                    # except for error logs which might be important for debugging
+                    
+                    # Count logs before deletion
+                    log_count = (
+                        db.query(LogEntryModel)
+                        .filter(LogEntryModel.run_id == run.id)
+                        .filter(LogEntryModel.event_type != LogEventType.NODE_ERROR.value)
+                        .filter(LogEntryModel.event_type != LogEventType.WORKFLOW_COMPLETE.value)
+                        .count()
+                    )
+                    
+                    # Delete non-critical logs (keep error logs and completion logs)
+                    deleted_logs = (
+                        db.query(LogEntryModel)
+                        .filter(LogEntryModel.run_id == run.id)
+                        .filter(LogEntryModel.event_type.in_([
+                            LogEventType.NODE_START.value,
+                            LogEventType.NODE_COMPLETE.value,
+                            LogEventType.STATE_UPDATE.value
+                        ]))
+                        .delete()
+                    )
+                    
+                    # Clear detailed state snapshots from remaining logs
+                    remaining_logs = (
+                        db.query(LogEntryModel)
+                        .filter(LogEntryModel.run_id == run.id)
+                        .all()
+                    )
+                    
+                    for log in remaining_logs:
+                        if log.state_snapshot:
+                            log.state_snapshot = None
+                    
+                    # Clear intermediate state data from run record
+                    run.current_state = None
+                    run.execution_path = []
+                    
+                    archived_count += 1
+                    deleted_count += deleted_logs
+                
+                db.commit()
+                
+                logger.info(f"Archived {archived_count} executions, deleted {deleted_count} log entries")
+                
+                return {
+                    "archived_count": archived_count,
+                    "deleted_count": deleted_count,
+                    "cutoff_date": cutoff_date.isoformat()
+                }
+                
+            except Exception as e:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to archive old executions: {str(e)}")
+    
+    def cleanup_old_executions(self, max_age_days: int) -> Dict[str, Any]:
+        """
+        Permanently delete old completed executions and their logs.
+        
+        Args:
+            max_age_days: Delete executions older than this many days
+            
+        Returns:
+            Dictionary containing cleanup operation results
+            
+        Raises:
+            ExecutionEngineError: If cleanup fails
+        """
+        try:
+            from datetime import timedelta
+            cutoff_date = datetime.utcnow() - timedelta(days=max_age_days)
+            
+            db = next(get_db())
+            try:
+                # Find old completed executions
+                old_runs = (
+                    db.query(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status.in_([
+                        ExecutionStatusEnum.COMPLETED.value,
+                        ExecutionStatusEnum.FAILED.value,
+                        ExecutionStatusEnum.CANCELLED.value
+                    ]))
+                    .filter(WorkflowRunModel.completed_at < cutoff_date)
+                    .all()
+                )
+                
+                deleted_executions = 0
+                deleted_logs = 0
+                
+                for run in old_runs:
+                    # Count logs before deletion
+                    log_count = (
+                        db.query(LogEntryModel)
+                        .filter(LogEntryModel.run_id == run.id)
+                        .count()
+                    )
+                    
+                    # Delete all logs for this run
+                    db.query(LogEntryModel).filter(LogEntryModel.run_id == run.id).delete()
+                    deleted_logs += log_count
+                    
+                    # Delete the run record
+                    db.delete(run)
+                    deleted_executions += 1
+                
+                db.commit()
+                
+                logger.info(f"Cleaned up {deleted_executions} executions and {deleted_logs} log entries")
+                
+                return {
+                    "deleted_executions": deleted_executions,
+                    "deleted_logs": deleted_logs,
+                    "cutoff_date": cutoff_date.isoformat()
+                }
+                
+            except Exception as e:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to cleanup old executions: {str(e)}")
+    
+    def get_execution_statistics(self) -> Dict[str, Any]:
+        """
+        Get statistics about workflow executions for monitoring and optimization.
+        
+        Returns:
+            Dictionary containing execution statistics
+            
+        Raises:
+            ExecutionEngineError: If statistics retrieval fails
+        """
+        try:
+            db = next(get_db())
+            try:
+                from sqlalchemy import func
+                
+                # Get overall statistics
+                total_executions = db.query(WorkflowRunModel).count()
+                
+                # Get status distribution
+                status_stats = (
+                    db.query(WorkflowRunModel.status, func.count(WorkflowRunModel.id))
+                    .group_by(WorkflowRunModel.status)
+                    .all()
+                )
+                
+                # Get recent activity (last 24 hours)
+                recent_cutoff = datetime.utcnow() - timedelta(hours=24)
+                recent_executions = (
+                    db.query(WorkflowRunModel)
+                    .filter(WorkflowRunModel.started_at >= recent_cutoff)
+                    .count()
+                )
+                
+                # Get average execution duration for completed runs
+                completed_runs = (
+                    db.query(WorkflowRunModel)
+                    .filter(WorkflowRunModel.status == ExecutionStatusEnum.COMPLETED.value)
+                    .filter(WorkflowRunModel.completed_at.isnot(None))
+                    .all()
+                )
+                
+                durations = []
+                for run in completed_runs:
+                    if run.completed_at and run.started_at:
+                        duration = (run.completed_at - run.started_at).total_seconds()
+                        durations.append(duration)
+                
+                avg_duration = sum(durations) / len(durations) if durations else 0
+                
+                # Get graph usage statistics
+                graph_stats = (
+                    db.query(WorkflowRunModel.graph_id, func.count(WorkflowRunModel.id))
+                    .group_by(WorkflowRunModel.graph_id)
+                    .order_by(func.count(WorkflowRunModel.id).desc())
+                    .limit(10)
+                    .all()
+                )
+                
+                return {
+                    "total_executions": total_executions,
+                    "status_distribution": {status: count for status, count in status_stats},
+                    "recent_executions_24h": recent_executions,
+                    "average_duration_seconds": avg_duration,
+                    "top_graphs": [{"graph_id": graph_id, "execution_count": count} for graph_id, count in graph_stats],
+                    "active_executions": len(self._active_executions),
+                    "queued_executions": self._execution_queue.qsize()
+                }
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            if isinstance(e, ExecutionEngineError):
+                raise
+            raise ExecutionEngineError(f"Failed to get execution statistics: {str(e)}")
+
     def shutdown(self) -> None:
         """
         Shutdown the execution engine and clean up resources.

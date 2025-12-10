@@ -7,8 +7,10 @@ import websockets
 import requests
 from datetime import datetime
 import time
+import pytest
 
 
+@pytest.mark.asyncio
 async def test_websocket_comprehensive():
     """Comprehensive test of WebSocket monitoring functionality."""
     print("Comprehensive WebSocket Monitoring Test")
@@ -39,7 +41,7 @@ async def test_websocket_comprehensive():
                 "nodes": [
                     {
                         "id": "start_node",
-                        "function_name": "test_function",
+                        "function_name": "workflow_test_function",
                         "parameters": {"message": "Starting comprehensive test"}
                     },
                     {

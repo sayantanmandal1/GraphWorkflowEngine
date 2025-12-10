@@ -11,8 +11,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..storage.database import get_db
 from ..storage.models import WorkflowRunModel, LogEntryModel
 from ..models.core import WorkflowState, ExecutionStatusEnum, LogEventType
-from .exceptions import StateManagementError, StorageError
-from .logging import get_logger
+from .exceptions import StateManagementError, StorageError, TransientError
+from .logging import get_logger, set_logging_context, clear_logging_context
+from .error_recovery import with_retry, RetryConfig
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,7 @@ class StateManager:
         self._state_lock_manager = threading.RLock()
         logger.info("StateManager initialized")
     
+    @with_retry(RetryConfig(max_attempts=3, retryable_exceptions=[StorageError, TransientError]))
     def create_run_state(self, run_id: str, graph_id: str, initial_state: Dict[str, Any]) -> None:
         """
         Create a new workflow run with initial state.
@@ -59,13 +61,33 @@ class StateManager:
             StateManagementError: If run creation fails
             StorageError: If database operations fail
         """
+        # Set logging context
+        set_logging_context(run_id=run_id, graph_id=graph_id, operation="create_run_state")
+        
         try:
             # Validate inputs
             if not run_id or not run_id.strip():
-                raise StateManagementError("Run ID cannot be empty")
+                raise StateManagementError(
+                    "Run ID cannot be empty",
+                    run_id=run_id,
+                    operation="create_run_state"
+                )
             
             if not graph_id or not graph_id.strip():
-                raise StateManagementError("Graph ID cannot be empty")
+                raise StateManagementError(
+                    "Graph ID cannot be empty",
+                    run_id=run_id,
+                    operation="create_run_state"
+                )
+            
+            # Check if run already exists
+            with self._state_lock_manager:
+                if run_id in self._active_runs:
+                    raise StateManagementError(
+                        f"Run {run_id} already exists",
+                        run_id=run_id,
+                        operation="create_run_state"
+                    )
             
             # Create WorkflowState object
             workflow_state = WorkflowState(
@@ -80,49 +102,68 @@ class StateManager:
                 self._active_runs[run_id] = workflow_state
                 self._run_locks[run_id] = threading.RLock()
             
-            # Persist to database
-            db = next(get_db())
-            try:
-                run_model = WorkflowRunModel(
-                    id=run_id,
-                    graph_id=graph_id,
-                    status=ExecutionStatusEnum.PENDING.value,
-                    initial_state=initial_state,
-                    current_state=workflow_state.model_dump(),
-                    final_state=None,
-                    current_node=None,
-                    execution_path=[],
-                    started_at=datetime.utcnow()
-                )
-                
-                db.add(run_model)
-                
-                # Log the state creation
-                self._log_state_event(
-                    db, run_id, None, LogEventType.WORKFLOW_START,
-                    f"Workflow run {run_id} created with initial state",
-                    workflow_state.model_dump()
-                )
-                
-                db.commit()
-                
-                logger.info(f"Created workflow run state: {run_id}")
-                
-            except SQLAlchemyError as e:
-                db.rollback()
-                raise StorageError(f"Failed to persist run state: {str(e)}")
-            finally:
-                db.close()
-                
-        except Exception as e:
-            # Clean up in-memory state if database operation failed
+            # Persist to database with error handling
+            self._persist_run_creation(run_id, graph_id, initial_state, workflow_state)
+            
+            logger.info(f"Successfully created run state for {run_id}")
+            
+        except (StateManagementError, StorageError):
+            # Clean up on failure
             with self._state_lock_manager:
                 self._active_runs.pop(run_id, None)
                 self._run_locks.pop(run_id, None)
+            raise
+        except Exception as e:
+            # Clean up on failure
+            with self._state_lock_manager:
+                self._active_runs.pop(run_id, None)
+                self._run_locks.pop(run_id, None)
+            logger.error(f"Unexpected error creating run state: {str(e)}", exc_info=True)
+            raise StateManagementError(
+                f"Failed to create run state: {str(e)}",
+                run_id=run_id,
+                operation="create_run_state"
+            )
+        finally:
+            clear_logging_context()
+    
+    def _persist_run_creation(self, run_id: str, graph_id: str, initial_state: Dict[str, Any], workflow_state: WorkflowState) -> None:
+        """Persist run creation to database with error handling."""
+        db = next(get_db())
+        try:
+            run_model = WorkflowRunModel(
+                id=run_id,
+                graph_id=graph_id,
+                status=ExecutionStatusEnum.PENDING.value,
+                initial_state=initial_state,
+                current_state=workflow_state.model_dump(),
+                final_state=None,
+                current_node=None,
+                execution_path=[],
+                started_at=datetime.utcnow()
+            )
             
-            if isinstance(e, (StateManagementError, StorageError)):
-                raise
-            raise StateManagementError(f"Failed to create run state: {str(e)}")
+            db.add(run_model)
+            
+            # Log the state creation
+            self._log_state_event(
+                db, run_id, None, LogEventType.WORKFLOW_START,
+                f"Workflow run {run_id} created with initial state",
+                workflow_state.model_dump()
+            )
+            
+            db.commit()
+            
+            logger.info(f"Created workflow run state: {run_id}")
+            
+        except SQLAlchemyError as e:
+            db.rollback()
+            raise StorageError(f"Failed to persist run state: {str(e)}")
+        except Exception as e:
+            db.rollback()
+            raise StorageError(f"Failed to persist run state: {str(e)}")
+        finally:
+            db.close()
     
     def update_state(self, run_id: str, updates: Dict[str, Any], node_id: Optional[str] = None) -> None:
         """

@@ -15,8 +15,11 @@ from ..core.exceptions import (
     GraphValidationError, 
     ExecutionEngineError, 
     StorageError,
-    NodeExecutionError
+    NodeExecutionError,
+    WorkflowEngineError,
+    create_error_response
 )
+from ..core.error_recovery import with_retry, RetryConfig, health_checker
 from ..models.core import (
     GraphDefinition, 
     ExecutionStatus, 
@@ -171,34 +174,30 @@ async def create_graph(
             validation_warnings=validation_result.warnings
         )
         
-    except GraphValidationError as e:
-        logger.warning(f"Graph validation failed: {str(e)}")
+    except WorkflowEngineError as e:
+        logger.warning(f"Workflow engine error during graph creation: {str(e)}")
+        
+        # Determine appropriate HTTP status code based on error type
+        if isinstance(e, GraphValidationError):
+            status_code = status.HTTP_400_BAD_REQUEST
+        elif isinstance(e, StorageError):
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        else:
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "ValidationError",
-                "message": str(e),
-                "details": {"graph_name": request.graph.name}
-            }
-        )
-    except StorageError as e:
-        logger.error(f"Storage error during graph creation: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "StorageError",
-                "message": "Failed to store graph",
-                "details": {"original_error": str(e)}
-            }
+            status_code=status_code,
+            detail=create_error_response(e)
         )
     except Exception as e:
-        logger.error(f"Unexpected error during graph creation: {str(e)}")
+        logger.error(f"Unexpected error during graph creation: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": "InternalError",
                 "message": "An unexpected error occurred while creating the graph",
-                "details": {"original_error": str(e)}
+                "details": {"original_error": str(e)},
+                "timestamp": datetime.utcnow().isoformat()
             }
         )
 
@@ -829,6 +828,364 @@ async def websocket_monitor(websocket: WebSocket):
             await _websocket_manager.disconnect(connection_id)
 
 
+# Historical data retrieval endpoints
+
+class HistoricalQueryRequest(BaseModel):
+    """Request model for historical data queries."""
+    graph_id: Optional[str] = Field(None, description="Filter by graph ID")
+    status: Optional[str] = Field(None, description="Filter by execution status")
+    start_date: Optional[datetime] = Field(None, description="Filter executions after this date")
+    end_date: Optional[datetime] = Field(None, description="Filter executions before this date")
+    limit: int = Field(100, ge=1, le=1000, description="Maximum number of results")
+    offset: int = Field(0, ge=0, description="Number of results to skip")
+
+
+class HistoricalExecutionSummary(BaseModel):
+    """Summary model for historical executions."""
+    run_id: str = Field(..., description="Unique run identifier")
+    graph_id: str = Field(..., description="Graph identifier")
+    status: str = Field(..., description="Execution status")
+    started_at: datetime = Field(..., description="Execution start time")
+    completed_at: Optional[datetime] = Field(None, description="Execution completion time")
+    duration_seconds: Optional[float] = Field(None, description="Execution duration in seconds")
+    error_message: Optional[str] = Field(None, description="Error message if failed")
+
+
+class HistoricalDataResponse(BaseModel):
+    """Response model for historical data queries."""
+    executions: List[HistoricalExecutionSummary] = Field(..., description="List of historical executions")
+    total_count: int = Field(..., description="Total number of matching executions")
+    has_more: bool = Field(..., description="Whether more results are available")
+
+
+@router.post(
+    "/history/executions",
+    response_model=HistoricalDataResponse,
+    summary="Query historical workflow executions",
+    description="Retrieve historical workflow execution data with filtering and pagination"
+)
+async def query_historical_executions(
+    request: HistoricalQueryRequest,
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> HistoricalDataResponse:
+    """
+    Query historical workflow executions.
+    
+    Args:
+        request: Query parameters for filtering and pagination
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        Historical execution data with pagination info
+        
+    Raises:
+        HTTPException: If query fails
+    """
+    try:
+        logger.debug(f"Querying historical executions with filters: {request.model_dump()}")
+        
+        # Get historical data from execution engine
+        result = execution_engine.query_historical_executions(
+            graph_id=request.graph_id,
+            status=request.status,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            limit=request.limit,
+            offset=request.offset
+        )
+        
+        logger.debug(f"Retrieved {len(result['executions'])} historical executions")
+        
+        return HistoricalDataResponse(
+            executions=result['executions'],
+            total_count=result['total_count'],
+            has_more=result['has_more']
+        )
+        
+    except Exception as e:
+        logger.error(f"Error querying historical executions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "HistoricalQueryError",
+                "message": "Failed to query historical executions",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.get(
+    "/history/execution/{run_id}",
+    response_model=ExecutionStatus,
+    summary="Get historical execution details",
+    description="Retrieve complete details of a historical workflow execution"
+)
+async def get_historical_execution(
+    run_id: str,
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> ExecutionStatus:
+    """
+    Get detailed information about a historical execution.
+    
+    Args:
+        run_id: ID of the workflow run
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        Complete execution status and state information
+        
+    Raises:
+        HTTPException: If execution not found or retrieval fails
+    """
+    try:
+        logger.debug(f"Getting historical execution details: {run_id}")
+        
+        # Get historical execution status
+        status = execution_engine.get_historical_execution_status(run_id)
+        
+        logger.debug(f"Retrieved historical execution details for run {run_id}")
+        
+        return status
+        
+    except ExecutionEngineError as e:
+        if "not found" in str(e).lower():
+            logger.warning(f"Historical execution not found: {run_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "ExecutionNotFound",
+                    "message": f"Historical execution with ID '{run_id}' not found",
+                    "details": {"run_id": run_id}
+                }
+            )
+        else:
+            logger.error(f"Error getting historical execution: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error": "HistoricalQueryError",
+                    "message": str(e),
+                    "details": {"run_id": run_id}
+                }
+            )
+    except Exception as e:
+        logger.error(f"Unexpected error getting historical execution: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "InternalError",
+                "message": "An unexpected error occurred while retrieving historical execution",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.get(
+    "/history/logs/{run_id}",
+    response_model=List[LogEntry],
+    summary="Get historical execution logs",
+    description="Retrieve execution logs for a historical workflow run"
+)
+async def get_historical_execution_logs(
+    run_id: str,
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> List[LogEntry]:
+    """
+    Get execution logs for a historical workflow run.
+    
+    Args:
+        run_id: ID of the workflow run
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        List of log entries in chronological order
+        
+    Raises:
+        HTTPException: If execution not found or log retrieval fails
+    """
+    try:
+        logger.debug(f"Getting historical execution logs: {run_id}")
+        
+        # Get historical execution logs
+        logs = execution_engine.get_historical_execution_logs(run_id)
+        
+        logger.debug(f"Retrieved {len(logs)} historical log entries for run {run_id}")
+        
+        return logs
+        
+    except ExecutionEngineError as e:
+        if "not found" in str(e).lower():
+            logger.warning(f"Historical execution not found for logs: {run_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "ExecutionNotFound",
+                    "message": f"Historical execution with ID '{run_id}' not found",
+                    "details": {"run_id": run_id}
+                }
+            )
+        else:
+            logger.error(f"Error getting historical execution logs: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error": "HistoricalQueryError",
+                    "message": str(e),
+                    "details": {"run_id": run_id}
+                }
+            )
+    except Exception as e:
+        logger.error(f"Unexpected error getting historical execution logs: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "InternalError",
+                "message": "An unexpected error occurred while retrieving historical execution logs",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.post(
+    "/history/archive",
+    summary="Archive old execution data",
+    description="Archive old completed executions to optimize database performance"
+)
+async def archive_old_executions(
+    max_age_days: int = 30,
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> Dict[str, Any]:
+    """
+    Archive old completed executions.
+    
+    Args:
+        max_age_days: Archive executions older than this many days
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        Archive operation results
+        
+    Raises:
+        HTTPException: If archiving fails
+    """
+    try:
+        logger.info(f"Starting archive operation for executions older than {max_age_days} days")
+        
+        # Perform archiving
+        result = execution_engine.archive_old_executions(max_age_days)
+        
+        logger.info(f"Archive operation completed: {result}")
+        
+        return {
+            "message": f"Archive operation completed successfully",
+            "archived_count": result.get("archived_count", 0),
+            "deleted_count": result.get("deleted_count", 0),
+            "max_age_days": max_age_days
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during archive operation: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "ArchiveError",
+                "message": "Failed to archive old executions",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.delete(
+    "/history/cleanup",
+    summary="Clean up old execution data",
+    description="Permanently delete old completed executions and their logs"
+)
+async def cleanup_old_executions(
+    max_age_days: int = 90,
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> Dict[str, Any]:
+    """
+    Clean up old completed executions.
+    
+    Args:
+        max_age_days: Delete executions older than this many days
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        Cleanup operation results
+        
+    Raises:
+        HTTPException: If cleanup fails
+    """
+    try:
+        logger.info(f"Starting cleanup operation for executions older than {max_age_days} days")
+        
+        # Perform cleanup
+        result = execution_engine.cleanup_old_executions(max_age_days)
+        
+        logger.info(f"Cleanup operation completed: {result}")
+        
+        return {
+            "message": f"Cleanup operation completed successfully",
+            "deleted_executions": result.get("deleted_executions", 0),
+            "deleted_logs": result.get("deleted_logs", 0),
+            "max_age_days": max_age_days
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup operation: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "CleanupError",
+                "message": "Failed to clean up old executions",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.get(
+    "/history/statistics",
+    summary="Get execution statistics",
+    description="Retrieve statistics about workflow executions for monitoring and optimization"
+)
+async def get_execution_statistics(
+    execution_engine: ExecutionEngine = Depends(get_execution_engine)
+) -> Dict[str, Any]:
+    """
+    Get statistics about workflow executions.
+    
+    Args:
+        execution_engine: Execution engine dependency
+        
+    Returns:
+        Dictionary containing execution statistics
+        
+    Raises:
+        HTTPException: If statistics retrieval fails
+    """
+    try:
+        logger.debug("Getting execution statistics")
+        
+        # Get statistics from execution engine
+        stats = execution_engine.get_execution_statistics()
+        
+        logger.debug("Retrieved execution statistics")
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting execution statistics: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "StatisticsError",
+                "message": "Failed to retrieve execution statistics",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
 @router.get(
     "/ws/connections",
     summary="Get WebSocket connection information",
@@ -860,6 +1217,138 @@ async def get_websocket_connections() -> Dict[str, Any]:
             detail={
                 "error": "WebSocketError",
                 "message": "Failed to retrieve connection information",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+# System monitoring and health endpoints
+
+@router.get(
+    "/system/health",
+    summary="Get system health status",
+    description="Retrieve comprehensive health status of all system components"
+)
+async def get_system_health() -> Dict[str, Any]:
+    """
+    Get comprehensive system health status.
+    
+    Returns:
+        Dictionary containing health status of all components
+    """
+    try:
+        results = await health_checker.run_all_checks()
+        return {
+            "service": "agent-workflow-engine",
+            "version": "1.0.0",
+            **results
+        }
+    except Exception as e:
+        logger.error(f"System health check failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "HealthCheckError",
+                "message": "Failed to retrieve system health status",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.get(
+    "/system/metrics",
+    summary="Get system metrics",
+    description="Retrieve system performance and usage metrics"
+)
+async def get_system_metrics(
+    execution_engine: ExecutionEngine = Depends(get_execution_engine),
+    tool_registry: ToolRegistry = Depends(get_tool_registry)
+) -> Dict[str, Any]:
+    """
+    Get system performance and usage metrics.
+    
+    Returns:
+        Dictionary containing system metrics
+    """
+    try:
+        # Get execution statistics
+        execution_stats = execution_engine.get_execution_statistics()
+        
+        # Get tool registry statistics
+        tools = tool_registry.list_tools()
+        
+        # Get active execution count
+        active_executions = len(execution_engine._active_executions)
+        
+        # Get WebSocket connection count
+        websocket_connections = 0
+        if _websocket_manager:
+            connection_info = _websocket_manager.get_connection_info()
+            websocket_connections = connection_info.get("active_connections", 0)
+        
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "execution_engine": {
+                "active_executions": active_executions,
+                "max_concurrent_executions": execution_engine._max_concurrent_executions,
+                "queue_size": execution_engine._execution_queue.qsize(),
+                **execution_stats
+            },
+            "tool_registry": {
+                "registered_tools": len(tools),
+                "tool_names": list(tools.keys())
+            },
+            "websocket_manager": {
+                "active_connections": websocket_connections
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving system metrics: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "MetricsError",
+                "message": "Failed to retrieve system metrics",
+                "details": {"original_error": str(e)}
+            }
+        )
+
+
+@router.get(
+    "/system/errors",
+    summary="Get recent system errors",
+    description="Retrieve recent system errors and their details"
+)
+async def get_recent_errors(
+    limit: int = 50,
+    severity: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get recent system errors.
+    
+    Args:
+        limit: Maximum number of errors to return
+        severity: Filter by error severity (low, medium, high, critical)
+    
+    Returns:
+        Dictionary containing recent errors
+    """
+    try:
+        # This would typically query a centralized error log
+        # For now, return a placeholder response
+        return {
+            "message": "Error logging system not yet implemented",
+            "timestamp": datetime.utcnow().isoformat(),
+            "requested_limit": limit,
+            "requested_severity": severity
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving system errors: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "ErrorRetrievalError",
+                "message": "Failed to retrieve system errors",
                 "details": {"original_error": str(e)}
             }
         )
